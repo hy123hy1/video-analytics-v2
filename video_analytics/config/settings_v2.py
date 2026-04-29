@@ -199,12 +199,12 @@ class StorageConfig:
     """Storage configuration."""
 
     type: str = "minio"
-    endpoint: str = "192.168.1.61:9000"
-    access_key: str = "admin"
-    secret_key: str = "12345678"
+    endpoint: str = "localhost:9000"
+    access_key: str = ""
+    secret_key: str = ""
     secure: bool = False
     bucket_name: str = "yolo"
-    public_url: str = "192.168.1.61:9000"
+    public_url: str = "localhost:9000"
     local_path: str = "./output"
 
     @classmethod
@@ -299,7 +299,7 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 5005
     debug: bool = False
-    rtsp_push_host: str = "192.168.1.61"
+    rtsp_push_host: str = "127.0.0.1"
     log_level: str = "INFO"
     log_file: Optional[str] = None
 

@@ -48,6 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from video_analytics.config.settings_v2 import AppConfigV2 as AppConfig
+from video_analytics.config.runtime_files import ensure_runtime_file
 from video_analytics.engines.factory import create_infer_engine
 from video_analytics.engines.ultralytics_engine import YOLOV8_CLASSES, SAFETY_HELMET_CLASSES, SMOKE_FIRE_CLASSES
 from video_analytics.detectors.intrusion_detector import IntrusionDetector, FenceRegion
@@ -66,7 +67,11 @@ from video_analytics.services.alarm_service import AlarmServiceFactory
 # =========================
 # 配置
 # =========================
-ENV_PATH = os.getenv("VA_ENV_FILE", ".env")
+ENV_PATH = ensure_runtime_file(
+    ".env",
+    template_name=".env.example",
+    env_var_name="VA_ENV_FILE",
+)
 app = Flask(__name__)
 CORS(app)
 
@@ -327,7 +332,7 @@ def rect_to_polygon(rect: Dict, default_area: Dict, frame_width: int, frame_heig
     ]
 
 
-def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: str = "192.168.1.61"):
+def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: str = "127.0.0.1"):
     """画框工作进程，使用有界队列解耦读帧和推流。"""
     import signal
 
@@ -576,9 +581,17 @@ def stop_fence_worker(camera_id: str):
 # =========================
 # 系统初始化
 # =========================
-def load_config(path: str = ENV_PATH) -> AppConfig:
+def load_config(path: str = str(ENV_PATH)) -> AppConfig:
     """Load config from .env file."""
+    logger.info("[Config] Loading V2 config from %s", path)
     return AppConfig.from_env_file(path)
+
+
+def get_rtsp_push_host() -> str:
+    """Return the configured RTSP push host."""
+    if system_state.config and system_state.config.server.rtsp_push_host:
+        return system_state.config.server.rtsp_push_host
+    return "127.0.0.1"
 
 
 def initialize_system() -> Tuple[StreamManagerV2, Dict]:
@@ -772,9 +785,7 @@ def set_fence():
         try:
             system_state.stream_manager.set_detector_fence(camera_id, fence_area)
 
-            output_host = "192.168.1.61"
-            if system_state.config and system_state.config.server.rtsp_push_host:
-                output_host = system_state.config.server.rtsp_push_host
+            output_host = get_rtsp_push_host()
 
             p = Process(
                 target=fence_worker,
@@ -795,9 +806,7 @@ def set_fence():
             }
             system_state.fence_dict[camera_id] = fence_area
 
-        output_host = "192.168.1.61"
-        if system_state.config and system_state.config.server.rtsp_push_host:
-            output_host = system_state.config.server.rtsp_push_host
+        output_host = get_rtsp_push_host()
 
         output_url = f"rtsp://{output_host}:554/Streaming/Channels/{camera_id}"
         logger.info(f"[API] 画框流输出地址: {output_url}")

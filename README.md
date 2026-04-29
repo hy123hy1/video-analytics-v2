@@ -201,6 +201,25 @@ python main_api_v2.py
 python main.py
 ```
 
+## PyInstaller 打包
+
+推荐使用现有的 spec 文件进行 V2 打包：
+
+```bash
+pyinstaller --clean --noconfirm main_api_v2.spec
+```
+
+打包完成后，产物默认位于：
+
+```text
+dist/main_api_v2/
+```
+
+部署时建议只修改外部配置文件，不改代码：
+
+- V2：编辑可执行文件同目录下的 `.env`
+- V1：编辑 `cfg/config.runtime.json`
+
 ## API 接口
 
 ### `POST /set_fence`

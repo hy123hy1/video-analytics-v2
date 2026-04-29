@@ -1,0 +1,75 @@
+{
+  "model": {
+    "person_model_path": "models/yolov8n.pt",
+    "helmet_model_path": "models/safehat.pt",
+    "smokefire_model_path": "models/smokefire.pt",
+    "backend": "ultralytics",
+    "input_size": [
+      640,
+      640
+    ],
+    "confidence": 0.4,
+    "iou": 0.45,
+    "device_id": 0,
+    "fp16": false
+  },
+  "detection": {
+    "intrusion_min_frames": 25,
+    "intrusion_cooldown": 60.0,
+    "intrusion_confidence": 0.5,
+    "helmet_min_frames": 25,
+    "helmet_cooldown": 60.0,
+    "helmet_confidence": 0.4,
+    "helmet_crop_padding": 0.2,
+    "overcrowd_max_people": 15,
+    "overcrowd_duration": 2.0,
+    "overcrowd_cooldown": 60.0,
+    "overcrowd_confidence": 0.4,
+    "fire_min_frames": 25,
+    "fire_cooldown": 60.0,
+    "fire_confidence": 0.4
+  },
+  "storage": {
+    "type": "minio",
+    "endpoint": "your-minio-host:9000",
+    "access_key": "your-access-key",
+    "secret_key": "your-secret-key",
+    "secure": false,
+    "bucket_name": "yolo",
+    "public_url": "your-minio-host:9000",
+    "local_path": "./output"
+  },
+  "alarm": {
+    "type": "http",
+    "endpoints": [],
+    "endpoints_intrusion": [
+      "http://your-server:8080/api/intrusion"
+    ],
+    "endpoints_helmet": [
+      "http://your-server:8080/api/helmet"
+    ],
+    "endpoints_overcrowd": [
+      "http://your-server:8080/api/overcrowd"
+    ],
+    "endpoints_smokefire": [
+      "http://your-server:8080/api/smokefire"
+    ],
+    "timeout": 10,
+    "retry_count": 3
+  },
+  "stream": {
+    "fps": 25,
+    "skip_frames": 0,
+    "max_reconnect": 5,
+    "reconnect_interval": 2.0,
+    "pre_buffer_seconds": 3,
+    "post_record_seconds": 3,
+    "enable_display": false
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5005,
+    "debug": false,
+    "rtsp_push_host": "your-rtsp-host"
+  }
+}

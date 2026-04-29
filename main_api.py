@@ -28,6 +28,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from video_analytics.config.settings import AppConfig
+from video_analytics.config.runtime_files import ensure_runtime_file
 from video_analytics.engines.factory import create_infer_engine
 from video_analytics.engines.ultralytics_engine import YOLOV8_CLASSES, SAFETY_HELMET_CLASSES
 from video_analytics.detectors.intrusion_detector import IntrusionDetector, FenceRegion
@@ -43,7 +44,12 @@ from video_analytics.services.video_service import VideoService, VideoConfig
 # =========================
 # 配置
 # =========================
-CONFIG_PATH = "./cfg/config.json"
+CONFIG_PATH = ensure_runtime_file(
+    "cfg/config.runtime.json",
+    template_name="cfg/config.runtime.example.json",
+    env_var_name="VA_CONFIG_FILE",
+    fallback_names=("cfg/config.json",),
+)
 app = Flask(__name__)
 CORS(app)
 
@@ -191,7 +197,7 @@ def rect_to_polygon(rect: Dict, default_area: Dict, frame_width: int, frame_heig
     ]
 
 
-def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: str = "192.168.1.61"):
+def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: str = "127.0.0.1"):
     """
     画框工作进程 - 拉流、画红框、推流
 
@@ -370,8 +376,9 @@ def stop_fence_worker(camera_id: str):
 # =========================
 # 系统初始化
 # =========================
-def load_config(path: str = CONFIG_PATH) -> AppConfig:
+def load_config(path: str = str(CONFIG_PATH)) -> AppConfig:
     """加载配置文件"""
+    print(f"[Config] Loading V1 config from: {path}")
     config = AppConfig.from_file(path)
 
     if os.path.exists(path):
@@ -385,10 +392,19 @@ def load_config(path: str = CONFIG_PATH) -> AppConfig:
                 config.alarm.endpoints_helmet = old_config["server_endpoints2"]
             if "server_endpoints3" in old_config:
                 config.alarm.endpoints_overcrowd = old_config["server_endpoints3"]
+            if "server_endpoints5" in old_config:
+                config.alarm.endpoints_smokefire = old_config["server_endpoints5"]
         except Exception as e:
             print(f"[Config] Failed to load old config: {e}")
 
     return config
+
+
+def get_rtsp_push_host() -> str:
+    """Return the configured RTSP push host."""
+    if system_state.config and system_state.config.server.rtsp_push_host:
+        return system_state.config.server.rtsp_push_host
+    return "127.0.0.1"
 
 
 def initialize_system() -> Tuple[StreamManager, Dict]:
@@ -799,7 +815,11 @@ def _start_camera_detection(camera_id: str, rtsp_url: str, algorithm_type: int,
             return jsonify({"status": "error", "message": "启动检测流失败"}), 500
 
         # 启动画框进程
-        p = Process(target=fence_worker, args=(camera_id, rtsp_url, fence_polygon), daemon=True)
+        p = Process(
+            target=fence_worker,
+            args=(camera_id, rtsp_url, fence_polygon, get_rtsp_push_host()),
+            daemon=True,
+        )
         p.start()
 
         system_state.active_fence_streams[camera_id] = {
@@ -810,7 +830,7 @@ def _start_camera_detection(camera_id: str, rtsp_url: str, algorithm_type: int,
         }
         system_state.fence_dict[camera_id] = fence_polygon
 
-    output_url = f"rtsp://192.168.1.61:554/Streaming/Channels/{camera_id}"
+    output_url = f"rtsp://{get_rtsp_push_host()}:554/Streaming/Channels/{camera_id}"
     print(f"[Webhook] 已{'更新' if fence_area else '添加'}摄像头 {camera_id}, 算法={algo_type_str}")
 
     return jsonify({
@@ -996,20 +1016,26 @@ def main():
 
     # 启动Flask服务
     config = system_state.config
+    host = "0.0.0.0"
     port = 5005
+    debug = False
+    if config:
+        host = config.server.host
+        port = config.server.port
+        debug = config.server.debug
 
     print(f"[Main] Starting API server on port {port}")
     print(f"[Main] API endpoints:")
-    print(f"  - POST http://0.0.0.0:{port}/set_fence      (设置围栏并开始检测)")
-    print(f"  - POST http://0.0.0.0:{port}/delete_stream  (停止检测)")
-    print(f"  - GET  http://0.0.0.0:{port}/status         (获取状态)")
-    print(f"  - POST http://0.0.0.0:{port}/camera/webhook (实时推送变更)")
-    print(f"  - POST http://0.0.0.0:{port}/camera/batch_sync (批量同步)")
+    print(f"  - POST http://{host}:{port}/set_fence      (设置围栏并开始检测)")
+    print(f"  - POST http://{host}:{port}/delete_stream  (停止检测)")
+    print(f"  - GET  http://{host}:{port}/status         (获取状态)")
+    print(f"  - POST http://{host}:{port}/camera/webhook (实时推送变更)")
+    print(f"  - POST http://{host}:{port}/camera/batch_sync (批量同步)")
     print("=" * 60)
 
     # 使用多线程模式支持并发请求
     # 注意：Flask的reloader会干扰信号处理，必须禁用
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
+    app.run(host=host, port=port, debug=debug, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":
