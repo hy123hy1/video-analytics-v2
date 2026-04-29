@@ -1,233 +1,367 @@
-# Video Analytics System - NVIDIA GPU Edition
+# Video Analytics System
 
-基于NVIDIA GPU (TensorRT/ONNX/PyTorch/Ultralytics) 的实时视频分析系统，从昇腾NPU迁移重构而来。
+基于 NVIDIA GPU 的实时视频分析系统，支持 RTSP 视频流接入、事件检测、告警上报、截图留证和事件视频生成。项目已从 Ascend NPU 方案迁移到面向 NVIDIA GPU 的多后端推理架构，并提供 V1 与 V2 两套流处理实现。
 
-## 特性
+当前代码重点已经演进到 V2 高性能架构：
 
-- **多后端推理**: Ultralytics (推荐)、TensorRT (生产)、ONNXRuntime (备选)、PyTorch (调试)
-- **统一推理接口**: `BaseInferEngine` 抽象层，无缝切换后端
-- **业务解耦**: 检测器、状态机、流处理完全分离
-- **三大检测场景**: 人员闯入、安全帽检测、人员超员
-- **状态机管理**: 统一的事件生命周期管理 (防抖、冷却)
-- **服务化架构**: 存储、报警、视频服务完全解耦
+- 生产者-消费者解耦的流处理链路
+- 有界队列，避免帧堆积导致内存持续增长
+- 环形帧缓冲区，减少频繁分配和复制
+- 视频生成线程池，避免事件高峰时线程爆炸
+- 每路流独立 detector 实例，避免共享状态带来的线程安全问题
+
+## 功能概览
+
+系统当前支持以下检测算法：
+
+| algorithmType | 算法名称 | 说明 |
+| --- | --- | --- |
+| `1` | 入侵检测 | 人员进入围栏区域触发事件 |
+| `2` | 安全帽检测 | 检测人员是否佩戴安全帽 |
+| `3` | 人群聚集检测 | 人数超过阈值时触发事件 |
+| `4` | 烟火检测 | 检测烟雾或明火 |
+
+支持的能力包括：
+
+- RTSP 拉流与自动重连
+- 多种推理后端切换：`ultralytics`、`tensorrt`、`onnx`、`torch`
+- 事件状态机管理：触发、持续、结束、冷却
+- 本地或 MinIO 存储截图与视频
+- HTTP、控制台等多种告警输出方式
+- 围栏绘制、叠框推流与事件证据保留
+
+## 版本说明
+
+### V1
+
+V1 采用串行处理模式：读帧、检测、事件处理在同一条主链路中执行。
+
+- 入口文件：`main_api.py`
+- 配置文件：`cfg/config.json`
+- 适合功能验证和兼容老部署方式
+
+### V2
+
+V2 是当前推荐版本，采用生产者-消费者架构，检测不再阻塞拉流。
+
+- 入口文件：`main_api_v2.py`
+- 配置模块：`video_analytics/config/settings_v2.py`
+- 环境变量：`.env` / `.env.example`
+- 新增性能接口：`GET /performance`
+
+V2 核心链路：
+
+```text
+RTSP Stream
+  -> FrameReader (Producer)
+  -> Bounded Queue
+  -> DetectionWorker (Consumer)
+  -> Event Handler
+  -> Storage / Alarm / VideoServiceV2
+```
 
 ## 项目结构
 
-```
+```text
 video_analytics/
-├── core/                      # 核心组件
-│   ├── state_machine.py      # 事件状态机
-│   └── stream_processor.py   # 流处理器/管理器
-├── engines/                   # 推理引擎
-│   ├── base_engine.py        # 抽象基类
-│   ├── tensorrt_engine.py    # TensorRT实现
-│   ├── onnx_engine.py        # ONNXRuntime实现
-│   ├── torch_engine.py       # PyTorch实现
-│   └── factory.py            # 工厂函数
-├── detectors/                 # 检测器
-│   ├── base_detector.py      # 抽象基类
-│   ├── intrusion_detector.py # 闯入检测
-│   ├── helmet_detector.py    # 安全帽检测
-│   └── overcrowd_detector.py # 超员检测
-├── services/                  # 服务层
-│   ├── storage_service.py    # 存储服务 (MinIO/本地)
-│   ├── alarm_service.py      # 报警服务 (HTTP/异步)
-│   └── video_service.py      # 视频服务
-├── config/                    # 配置
-│   └── settings.py           # 配置管理
-└── __init__.py
+  core/
+    state_machine.py
+    stream_processor.py
+    stream_processor_v2.py
+  detectors/
+    base_detector.py
+    intrusion_detector.py
+    helmet_detector.py
+    overcrowd_detector.py
+    smokefire_detector.py
+  engines/
+    base_engine.py
+    factory.py
+    ultralytics_engine.py
+    tensorrt_engine.py
+    onnx_engine.py
+    torch_engine.py
+  services/
+    alarm_service.py
+    storage_service.py
+    video_service.py
+    video_service_v2.py
+  config/
+    settings.py
+    settings_v2.py
+  utils/
+    logger.py
+    exceptions.py
+    yolo_utils.py
+    ffmpeg_utils.py
+    viz_utils.py
 
-main.py                        # 主入口
-MIGRATION_GUIDE.md            # 迁移指南
+main.py
+main_api.py
+main_api_v2.py
+cfg/config.json
+.env.example
 ```
 
-## 快速开始
+## 环境准备
 
-### 1. 环境安装
+### 1. 安装依赖
 
-**推荐方案 (Ultralytics - 最简单)**
 ```bash
-# 安装Ultralytics (自动安装PyTorch)
-pip install ultralytics
-
-# 基础依赖
-pip install opencv-python numpy requests minio
+pip install -r requirements.txt
 ```
 
-**其他方案 (可选)**
+`requirements.txt` 当前包含：
+
+- `numpy`
+- `opencv-python`
+- `requests`
+- `minio`
+- `onnxruntime-gpu`
+- `torch`
+- `torchvision`
+- `ultralytics`
+
+如果要使用 TensorRT，请按 NVIDIA 官方方式安装 TensorRT，并额外安装：
+
 ```bash
-# TensorRT (生产环境最佳性能)
 pip install tensorrt pycuda
-
-# ONNX Runtime (跨平台)
-pip install onnxruntime-gpu
 ```
 
-### 2. 模型准备
+### 2. 准备模型
 
-**方式1: 使用Ultralytics官方模型 (推荐)**
+默认模型路径：
+
+- 人员检测：`models/yolov8n.pt`
+- 安全帽检测：`models/safehat.pt`
+- 烟火检测：`video_analytics/models/smokefire.pt`
+
+也可以通过环境变量覆盖这些路径。
+
+## 配置方式
+
+### V1 配置
+
+V1 使用 `cfg/config.json`。
+
+### V2 配置
+
+V2 使用环境变量配置，命名规则为：
+
+```text
+VA_<SECTION>_<KEY>
+```
+
+建议先复制示例文件：
+
 ```bash
-# 下载YOLOv8n模型
-mkdir -p models
-# 首次运行时会自动下载，或手动下载:
-# wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt -O models/yolov8n.pt
+copy .env.example .env
 ```
 
-**方式2: TensorRT引擎 (生产环境)**
+常用配置项示例：
+
+```env
+VA_SERVER_HOST=0.0.0.0
+VA_SERVER_PORT=5005
+VA_MODEL_BACKEND=ultralytics
+VA_MODEL_PERSON_MODEL_PATH=models/yolov8n.pt
+VA_MODEL_HELMET_MODEL_PATH=models/safehat.pt
+VA_MODEL_SMOKEFIRE_MODEL_PATH=video_analytics/models/smokefire.pt
+VA_MODEL_CONFIDENCE=0.4
+
+VA_DETECTION_INTRUSION_MIN_FRAMES=25
+VA_DETECTION_HELMET_MIN_FRAMES=25
+VA_DETECTION_OVERCROWD_MAX_PEOPLE=15
+VA_DETECTION_FIRE_MIN_FRAMES=25
+
+VA_STORAGE_TYPE=minio
+VA_ALARM_TYPE=http
+VA_STREAM_FPS=25
+VA_STREAM_PRE_BUFFER_SECONDS=3
+VA_STREAM_POST_RECORD_SECONDS=3
+```
+
+## 启动方式
+
+### V1 API 模式
+
 ```bash
-# 将 .engine 文件放入 models/ 目录
-# 或使用ONNX转换:
-python -c "
-from video_analytics.engines.factory import convert_model
-convert_model('yolov8n.onnx', 'models/yolov8n.engine')
-"
+python main_api.py
 ```
 
-### 3. 配置
+### V2 API 模式
 
-创建 `cfg/config.json` (参考 `cfg/config.json.example`):
-
-**Ultralytics配置 (推荐)**
-```json
-{
-  "model": {
-    "person_model_path": "models/yolov8n.pt",
-    "helmet_model_path": "models/safehat.pt",
-    "backend": "ultralytics",
-    "confidence": 0.4,
-    "device_id": 0
-  },
-  "detection": {
-    "intrusion_min_frames": 25,
-    "helmet_min_frames": 25,
-    "overcrowd_max_people": 15
-  },
-  "storage": {
-    "type": "local",
-    "local_path": "./output"
-  },
-  "alarm": {
-    "type": "console"
-  }
-}
+```bash
+python main_api_v2.py
 ```
 
-**TensorRT配置 (生产环境)**
-```json
-{
-  "model": {
-    "person_model_path": "models/yolov8n.engine",
-    "helmet_model_path": "models/safehat.engine",
-    "backend": "tensorrt",
-    "confidence": 0.4,
-    "device_id": 0,
-    "fp16": true
-  }
-}
-```
-
-### 4. 运行
+### 旧版轮询模式
 
 ```bash
 python main.py
 ```
 
-## 核心类使用示例
+## API 接口
 
-### 推理引擎
+### `POST /set_fence`
 
-```python
-from video_analytics.engines.factory import create_infer_engine
+启动一路检测流，并为该相机设置围栏。
 
-# TensorRT
-engine = create_infer_engine(
-    model_path="yolov8n.engine",
-    backend="tensorrt",
-    confidence=0.4
-)
+请求示例：
 
-# 推理
-detections, context = engine.infer(frame)
-for det in detections:
-    print(f"Detected {det.class_name} at {det.to_xyxy()}")
+```json
+{
+  "cam_id": "cam_001",
+  "url": "rtsp://example.com/live",
+  "algorithmType": 1,
+  "fence_area": {
+    "x1": 120,
+    "y1": 80,
+    "x2": 820,
+    "y2": 420
+  },
+  "default_area": {
+    "width": 960,
+    "height": 540
+  }
+}
 ```
 
-### 检测器
+说明：
 
-```python
-from video_analytics.detectors.intrusion_detector import IntrusionDetector
+- `algorithmType` 必填，支持 `1`、`2`、`3`、`4`
+- `cam_id` 为流的唯一标识
+- `url` 为 RTSP 地址
+- 未提供 `fence_area` 时，系统会默认使用整帧区域
 
-# 创建检测器
-detector = IntrusionDetector(engine, config={"min_frames": 25})
+调用示例：
 
-# 设置围栏
-detector.set_fence_from_points("cam_001", [
-    (100, 100), (500, 100), (500, 400), (100, 400)
-])
-
-# 处理帧
-result = detector.process(context)
-if result.triggered:
-    print(f"Event: {result.event}")
+```bash
+curl -X POST "http://127.0.0.1:5005/set_fence" \
+  -H "Content-Type: application/json" \
+  -d "{\"cam_id\":\"cam_001\",\"url\":\"rtsp://example.com/live\",\"algorithmType\":1}"
 ```
 
-### 状态机
+### `POST /delete_stream`
 
-```python
-from video_analytics.core.state_machine import EventStateMachine, EventState
+停止并移除指定流。
 
-sm = EventStateMachine(min_trigger_frames=25, cooldown_seconds=60)
-state = sm.update(detected=True)
-
-if state == EventState.TRIGGERED:
-    print("Event started!")
-elif state == EventState.COOLDOWN:
-    print("Event ended")
+```json
+{
+  "cam_id": "cam_001"
+}
 ```
 
-## 推理后端对比
+### `GET /status`
 
-| 后端 | 速度 | 易用性 | 适用场景 |
-|------|------|--------|----------|
-| **Ultralytics** | ⭐⭐ | ⭐⭐⭐ | **推荐 - 简单高效** |
-| TensorRT | ⭐⭐⭐ | ⭐ | 生产环境极限性能 |
-| ONNXRuntime | ⭐⭐ | ⭐⭐ | 跨平台部署 |
-| PyTorch | ⭐ | ⭐⭐⭐ | 调试/原型 |
+返回系统运行状态，包含：
 
-切换后端只需修改配置:
-```python
-# Ultralytics (推荐 - 自动处理YOLO模型)
-backend="ultralytics", model_path="model.pt"
+- 当前活跃流数量
+- 每路流的检测统计
+- 视频服务统计
+- V2 架构优化信息
 
-# TensorRT (生产环境)
-backend="tensorrt", model_path="model.engine"
+### `GET /performance`
 
-# ONNX
-backend="onnx", model_path="model.onnx"
+V2 专用性能接口，返回：
+
+- 每路流的 `fps`
+- `detection_fps`
+- 平均检测延迟
+- 丢帧数、丢事件数、丢视频任务数
+- 队列与环形缓冲区状态
+- 系统 CPU / 内存占用
+
+## 核心设计
+
+### 推理引擎层
+
+所有推理后端都实现统一接口，工厂方法会根据模型文件或显式配置创建对应引擎：
+
+- `UltralyticsEngine`
+- `TensorRTInferEngine`
+- `ONNXInferEngine`
+- `TorchInferEngine`
+
+### Detector 层
+
+Detector 对外统一表现为：
+
+```text
+DetectionContext -> DetectionResultBundle
 ```
 
-## 迁移指南
+每个 detector 内部通过状态机管理事件生命周期，避免每帧都重复触发告警。
 
-详见 [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
+### 事件状态机
 
-## 性能测试
+状态机位于 `video_analytics/core/state_machine.py`，负责管理：
 
-```python
-from video_analytics.engines.factory import create_infer_engine
+- `IDLE`
+- `COUNTING`
+- `TRIGGERED`
+- `ONGOING`
+- `COOLDOWN`
 
-engine = create_infer_engine("yolov8n.engine", backend="tensorrt")
+### 工具模块
 
-# 预热
-engine.warmup(10)
+`video_analytics/utils/` 已经沉淀出一组通用工具：
 
-# 查看统计
-print(engine.get_stats())
-# {
-#   'inference_count': 1000,
-#   'avg_inference_time': 0.003,
-#   'fps': 333.3
-# }
+- `logger.py`：统一日志能力
+- `exceptions.py`：标准化异常体系
+- `yolo_utils.py`：YOLO 输出解析与几何工具
+- `ffmpeg_utils.py`：FFmpeg 拉流、推流与进程清理
+- `viz_utils.py`：框、围栏、时间戳等可视化工具
+
+## 运行与验证
+
+### 基础验证
+
+```bash
+python test_ultralytics.py
+python test_detection.py
 ```
+
+### API 验证
+
+启动后可用以下方式验证：
+
+```bash
+curl -X POST "http://127.0.0.1:5005/set_fence" \
+  -H "Content-Type: application/json" \
+  -d "{\"cam_id\":\"test\",\"url\":\"rtsp://your-stream\",\"algorithmType\":1}"
+```
+
+重点验证项：
+
+- `POST /set_fence` 可正常启动检测
+- 对同一个 `cam_id` 再次调用时，旧流能被干净重启
+- `Ctrl+C` 后所有线程和 FFmpeg 进程能及时退出
+- V2 下 `GET /performance` 能返回性能指标
+
+## 当前已落地的优化点
+
+- V2 流处理已引入生产者-消费者解耦
+- 帧队列为有界队列，避免无限堆积
+- 事件视频生成改为 `VideoServiceV2` 线程池模型
+- 每路流独立 detector 实例，提升线程安全性
+- 配置系统已支持 `.env` 与环境变量覆盖
+- 统一工具模块已替换大量重复逻辑
+- 已支持烟火检测 `algorithmType=4`
+
+## 已知注意点
+
+- 围栏坐标缩放依赖前端传入的 `default_area`
+- 围栏推流与检测共用同一路 RTSP 源，但链路已经解耦
+- FFmpeg 清理仍然依赖进程级回收逻辑，部署时建议重点验证关闭流程
+- V2 为了线程安全采用独立 detector 实例，会增加一定内存占用
+
+## 相关文档
+
+- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
+- [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md)
+- [QUICK_START.md](QUICK_START.md)
+- [CODE_QUALITY_IMPROVEMENTS.md](CODE_QUALITY_IMPROVEMENTS.md)
 
 ## License
 
