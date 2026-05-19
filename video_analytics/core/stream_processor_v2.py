@@ -39,6 +39,35 @@ from video_analytics.core.state_machine import EventState
 logger = logging.getLogger(__name__)
 
 
+def build_predicted_video_url(storage_service: BaseStorageService, camera_id: str, timestamp_str: str) -> Optional[str]:
+    """Build the future video URL/path using the same timestamp as image_url."""
+    if not timestamp_str:
+        return None
+
+    try:
+        object_name = storage_service._generate_object_name(  # type: ignore[attr-defined]
+            camera_id,
+            "",
+            "mp4",
+            custom_timestamp_str=timestamp_str,
+        )
+    except Exception:
+        return None
+
+    base_path = getattr(storage_service, "base_path", None)
+    if base_path:
+        return os.path.join(base_path, object_name)
+
+    build_public_url = getattr(storage_service, "_build_public_url", None)
+    if callable(build_public_url):
+        try:
+            return build_public_url(object_name)
+        except Exception:
+            pass
+
+    return object_name
+
+
 class StreamState(Enum):
     """流状态"""
     IDLE = "idle"
@@ -236,7 +265,8 @@ class StreamProcessorV2:
         storage_service: BaseStorageService,
         alarm_service: BaseAlarmService,
         video_service: VideoService,
-        on_event: Optional[Callable[[str, DetectionEvent, DetectionResultBundle], None]] = None
+        on_event: Optional[Callable[[str, DetectionEvent, DetectionResultBundle], None]] = None,
+        on_result: Optional[Callable[[str, DetectionResultBundle], None]] = None,
     ):
         self.config = config
         self.detector_factory = detector_factory
@@ -244,6 +274,7 @@ class StreamProcessorV2:
         self.alarm = alarm_service
         self.video = video_service
         self.on_event = on_event
+        self.on_result = on_result
 
         # 状态
         self._state = StreamState.IDLE
@@ -568,6 +599,12 @@ class StreamProcessorV2:
                 # 执行检测
                 result = detector.process(context)
 
+                if self.on_result:
+                    try:
+                        self.on_result(self.config.camera_id, result)
+                    except Exception as e:
+                        logger.error(f"Result callback error: {e}")
+
                 # 处理事件
                 if result.triggered and result.event:
                     self._handle_event(algo_type, result, context)
@@ -646,6 +683,13 @@ class StreamProcessorV2:
                     if upload_result.object_name:
                         image_filename = os.path.basename(upload_result.object_name)
                         timestamp_str = os.path.splitext(image_filename)[0]
+                        predicted_video_url = build_predicted_video_url(
+                            self.storage,
+                            self.config.camera_id,
+                            timestamp_str,
+                        )
+                        if predicted_video_url:
+                            event.video_url = predicted_video_url
             except Exception as e:
                 logger.error(f"Image upload failed: {e}")
 
@@ -835,6 +879,22 @@ class StreamManagerV2:
 
         # 锁
         self._lock = threading.Lock()
+        self._event_callback: Optional[Callable[[str, DetectionEvent, DetectionResultBundle], None]] = None
+        self._result_callback: Optional[Callable[[str, DetectionResultBundle], None]] = None
+
+    def set_event_callback(
+        self,
+        callback: Optional[Callable[[str, DetectionEvent, DetectionResultBundle], None]],
+    ):
+        """Register a manager-level event callback."""
+        self._event_callback = callback
+
+    def set_result_callback(
+        self,
+        callback: Optional[Callable[[str, DetectionResultBundle], None]],
+    ):
+        """Register a manager-level per-frame result callback."""
+        self._result_callback = callback
 
     def register_detector_factory(self, algo_type: str, factory: Callable[[], BaseDetector]):
         """
@@ -870,7 +930,8 @@ class StreamManagerV2:
                 storage_service=self.storage,
                 alarm_service=self.alarm,
                 video_service=self.video,
-                on_event=self._on_event
+                on_event=self._on_event,
+                on_result=self._on_result,
             )
 
             # 先启动，成功后再添加到字典
@@ -933,4 +994,16 @@ class StreamManagerV2:
 
     def _on_event(self, camera_id: str, event: DetectionEvent, result: DetectionResultBundle):
         """事件回调"""
-        pass
+        if self._event_callback:
+            try:
+                self._event_callback(camera_id, event, result)
+            except Exception as e:
+                logger.error(f"[StreamManagerV2] Event callback failed: {e}")
+
+    def _on_result(self, camera_id: str, result: DetectionResultBundle):
+        """Per-frame detection result callback."""
+        if self._result_callback:
+            try:
+                self._result_callback(camera_id, result)
+            except Exception as e:
+                logger.error(f"[StreamManagerV2] Result callback failed: {e}")

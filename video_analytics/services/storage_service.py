@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import io
 import os
+from urllib.parse import urlparse
 
 import numpy as np
 import cv2
@@ -129,6 +130,39 @@ class BaseStorageService(ABC):
         label_part = f"{label}/" if label else ""
         return f"{camera_id}/{label_part}{timestamp_str}.{extension}"
 
+    def _build_public_url(self, object_name: str) -> str:
+        """Build a public-facing URL/path for an uploaded object."""
+        public_base = (self.config.public_url or "").strip()
+        endpoint_base = (self.config.endpoint or "").strip()
+
+        def _host_without_scheme(value: str) -> str:
+            if not value:
+                return ""
+            if value.startswith(("http://", "https://")):
+                return (urlparse(value).netloc or "").strip()
+            return value.strip()
+
+        public_host = _host_without_scheme(public_base)
+        endpoint_host = _host_without_scheme(endpoint_base)
+
+        localhost_hosts = {"localhost", "127.0.0.1", "0.0.0.0"}
+        if not public_base or (
+            public_host.split(":")[0] in localhost_hosts
+            and endpoint_host
+            and endpoint_host.split(":")[0] not in localhost_hosts
+        ):
+            public_base = endpoint_base
+
+        if not public_base:
+            scheme = "https" if self.config.secure else "http"
+            public_base = f"{scheme}://{self.config.endpoint}"
+        elif not public_base.startswith(("http://", "https://")):
+            scheme = "https" if self.config.secure else "http"
+            public_base = f"{scheme}://{public_base}"
+
+        public_base = public_base.rstrip("/")
+        return f"{public_base}/{self.config.bucket_name}/{object_name}"
+
 
 class MinioStorageService(BaseStorageService):
     """
@@ -192,7 +226,7 @@ class MinioStorageService(BaseStorageService):
             )
 
             # 构建URL
-            url = f"{self.config.public_url}/{self.config.bucket_name}/{object_name}"
+            url = self._build_public_url(object_name)
 
             print(f"[MinIO] Image uploaded: {object_name}")
 
@@ -244,7 +278,7 @@ class MinioStorageService(BaseStorageService):
             )
 
             # 构建URL
-            url = f"{self.config.public_url}/{self.config.bucket_name}/{object_name}"
+            url = self._build_public_url(object_name)
 
             print(f"[MinIO] Video uploaded: {object_name}")
 

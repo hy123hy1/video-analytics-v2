@@ -105,7 +105,27 @@ class BaseAlarmService(ABC):
 
     def _format_event(self, event: DetectionEvent) -> Dict[str, Any]:
         """格式化事件为报警数据结构"""
-        return event.to_dict()
+        objects = []
+        for item in event.objects:
+            bbox = item.get("bbox", [])
+            bbox_as_str = [str(v) for v in bbox]
+            confidence = item.get("confidence", event.confidence)
+            confidence_str = "" if confidence is None else f"{float(confidence):.2f}"
+
+            objects.append({
+                "confidence": confidence_str,
+                "bbox": bbox_as_str,
+                "status": str(item.get("status", event.event_type.value)),
+                "label": str(item.get("label", item.get("class_name", ""))),
+                "warning_image": event.image_url or "",
+                "warning_video": event.video_url or "",
+            })
+
+        return {
+            "camera_id": str(event.camera_id),
+            "objects": objects,
+            "timestamp": event.timestamp.isoformat(),
+        }
 
 
 class HttpAlarmService(BaseAlarmService):
@@ -148,6 +168,10 @@ class HttpAlarmService(BaseAlarmService):
         # 根据事件类型获取端点
         endpoints = self._get_endpoints_for_event(event)
 
+        if event.event_type.value == "intrusion":
+            print("[Alarm] Intrusion payload:")
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+
         for endpoint in endpoints:
             result = self._send_to_endpoint(endpoint, data)
             results.append(result)
@@ -173,6 +197,13 @@ class HttpAlarmService(BaseAlarmService):
 
                 # 检查响应
                 if response.status_code == 200:
+                    print(
+                        f"[Alarm] Sent successfully: "
+                        f"event_type={event.event_type.value} "
+                        f"camera_id={data.get('camera_id')} "
+                        f"endpoint={endpoint} "
+                        f"status_code={response.status_code}"
+                    )
                     return AlarmResult(
                         success=True,
                         endpoint=endpoint,

@@ -67,6 +67,44 @@ system_state = SystemState()
 
 
 # =========================
+# 请求参数规范化
+# =========================
+def normalize_algorithm_type(value) -> str | None:
+    """Accept int/float/string algorithmType values and normalize to internal id."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        if value.isdigit():
+            value = int(value)
+        else:
+            return None
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        value = int(value)
+
+    algo_map = {1: "1", 2: "2", 3: "3", 4: "4"}
+    return algo_map.get(value)
+
+
+def normalize_camera_id(value) -> str | None:
+    """Accept numeric or string cam_id and normalize to a trimmed string."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+    else:
+        value = str(value).strip()
+
+    return value or None
+
+
+# =========================
 # 画框服务相关 (从 push.py 迁移)
 # =========================
 class FFmpegCapture:
@@ -585,18 +623,16 @@ def set_fence():
     rtsp_url = data.get("url")
     rect = data.get("fence_area")
     default_area = data.get("default_area", {"width": 960, "height": 540})
-    camera_id = str(data.get("cam_id"))
+    camera_id = normalize_camera_id(data.get("cam_id"))
+    algo_type_str = normalize_algorithm_type(algorithm_type)
 
     # 参数校验
-    if not all([algorithm_type, rtsp_url, camera_id]):
+    if not all([algo_type_str, rtsp_url, camera_id]):
         return jsonify({
             "status": "error",
             "message": "缺少必要参数: algorithmType, url, cam_id"
         }), 400
 
-    # 算法类型映射: 前端 1,2,3 -> 内部 "1","2","3"   4即为新增算法
-    algo_map = {1: "1", 2: "2", 3: "3", 4: "4"}
-    algo_type_str = algo_map.get(algorithm_type)
     if not algo_type_str:
         return jsonify({
             "status": "error",
@@ -633,7 +669,7 @@ def delete_stream():
     }
     """
     data = request.get_json() or {}
-    camera_id = str(data.get("cam_id"))
+    camera_id = normalize_camera_id(data.get("cam_id"))
 
     if not camera_id:
         return jsonify({
@@ -710,7 +746,7 @@ def camera_webhook():
     if action not in ("add", "remove", "update"):
         return jsonify({"status": "error", "message": "action必须是 add/remove/update"}), 400
 
-    camera_id = str(camera_data.get("cam_id", ""))
+    camera_id = normalize_camera_id(camera_data.get("cam_id", ""))
     if not camera_id:
         return jsonify({"status": "error", "message": "缺少 cam_id"}), 400
 
@@ -762,10 +798,12 @@ def _remove_camera(camera_id: str, silent: bool = False):
 def _start_camera_detection(camera_id: str, rtsp_url: str, algorithm_type: int,
                             fence_area: dict = None, default_area: dict = None):
     """内部函数：启动摄像头检测（复用 set_fence 核心逻辑）"""
-    algo_map = {1: "1", 2: "2", 3: "3", 4: "4"}
-    algo_type_str = algo_map.get(algorithm_type)
+    camera_id = normalize_camera_id(camera_id)
+    algo_type_str = normalize_algorithm_type(algorithm_type)
     if not algo_type_str:
         return jsonify({"status": "error", "message": f"无效的 algorithmType: {algorithm_type}"}), 400
+    if not camera_id:
+        return jsonify({"status": "error", "message": "cam_id 不能为空"}), 400
 
     # 获取视频分辨率
     cap = cv2.VideoCapture(rtsp_url)
@@ -867,7 +905,7 @@ def camera_batch_sync():
     current_ids = set()
 
     for cam in cameras:
-        cam_id = str(cam.get("cam_id", ""))
+        cam_id = normalize_camera_id(cam.get("cam_id", ""))
         if not cam_id:
             continue
         current_ids.add(cam_id)

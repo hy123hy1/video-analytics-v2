@@ -23,7 +23,7 @@ import subprocess
 import queue
 from datetime import datetime
 from typing import List, Dict, Optional, Set, Tuple, Callable
-from multiprocessing import Process
+from multiprocessing import Manager, Process
 from dataclasses import dataclass, field
 
 # 添加项目路径
@@ -55,13 +55,14 @@ from video_analytics.detectors.intrusion_detector import IntrusionDetector, Fenc
 from video_analytics.detectors.helmet_detector import HelmetDetector
 from video_analytics.detectors.overcrowd_detector import OvercrowdDetector
 from video_analytics.detectors.smokefire_detector import SmokeFireDetector
-from video_analytics.detectors.base_detector import BaseDetector
+from video_analytics.detectors.base_detector import BaseDetector, DetectionResultBundle
 
 # V2 组件
 from video_analytics.core.stream_processor_v2 import StreamManagerV2, StreamConfig
 from video_analytics.services.video_service_v2 import VideoServiceV2, VideoConfig
 from video_analytics.services.storage_service import StorageServiceFactory
 from video_analytics.services.alarm_service import AlarmServiceFactory
+from video_analytics.utils.viz_utils import draw_text
 
 
 # =========================
@@ -84,12 +85,61 @@ class SystemState:
         self.active_fence_streams: Dict[str, Dict] = {}
         self.fence_dict: Dict[str, List] = {}
         self.lock = threading.Lock()
+        self.preview_state_manager = None
+        self.preview_event_states = None
+        self.preview_detection_states = None
 
         # 性能统计
         self.start_time = datetime.now()
         self.total_requests = 0
 
 system_state = SystemState()
+
+
+def ensure_preview_state_manager():
+    """Lazily create the shared preview state manager in the main process only."""
+    if system_state.preview_state_manager is None:
+        system_state.preview_state_manager = Manager()
+        system_state.preview_event_states = system_state.preview_state_manager.dict()
+        system_state.preview_detection_states = system_state.preview_state_manager.dict()
+
+
+# =========================
+# 请求参数规范化
+# =========================
+def normalize_algorithm_type(value) -> Optional[str]:
+    """Accept int/float/string algorithmType values and normalize to internal id."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        if value.isdigit():
+            value = int(value)
+        else:
+            return None
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        value = int(value)
+
+    algo_map = {1: "1", 2: "2", 3: "3", 4: "4"}
+    return algo_map.get(value)
+
+
+def normalize_camera_id(value) -> Optional[str]:
+    """Accept numeric or string cam_id and normalize to a trimmed string."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+    else:
+        value = str(value).strip()
+
+    return value or None
 
 
 # =========================
@@ -332,7 +382,15 @@ def rect_to_polygon(rect: Dict, default_area: Dict, frame_width: int, frame_heig
     ]
 
 
-def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: str = "127.0.0.1"):
+def fence_worker(
+    camera_id: str,
+    rtsp_url: str,
+    fence_area: List,
+    output_host: str = "127.0.0.1",
+    algorithm_type: Optional[str] = None,
+    preview_event_states=None,
+    preview_detection_states=None,
+):
     """画框工作进程，使用有界队列解耦读帧和推流。"""
     import signal
 
@@ -346,6 +404,61 @@ def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: s
     push_proc = None
     frame_counter = 0
     last_log_time = time.time()
+    overlay_ttl_seconds = 5.0
+
+    def draw_preview_overlay(frame: np.ndarray) -> np.ndarray:
+        result = frame
+
+        if preview_detection_states is not None:
+            detection_state = preview_detection_states.get(camera_id)
+            if detection_state:
+                updated_at = float(detection_state.get("updated_at", 0))
+                if time.time() - updated_at <= 1.5:
+                    for det in detection_state.get("detections", []):
+                        bbox = det.get("bbox", [])
+                        if len(bbox) != 4:
+                            continue
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        label = det.get("label", "")
+                        confidence = det.get("confidence")
+                        text = label
+                        if confidence is not None:
+                            text = f"{label} {confidence:.2f}"
+                        try:
+                            cv2.rectangle(result, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                            result = draw_text(
+                                result,
+                                text,
+                                (x1, max(20, y1 - 8)),
+                                color=(0, 255, 255),
+                                font_scale=0.6,
+                                thickness=2,
+                                bg_color=(0, 0, 0),
+                            )
+                        except Exception:
+                            continue
+
+        if preview_event_states is not None:
+            event_state = preview_event_states.get(camera_id)
+            if event_state:
+                updated_at = float(event_state.get("updated_at", 0))
+                if time.time() - updated_at <= overlay_ttl_seconds:
+                    event_label = event_state.get("event_label", "TRIGGERED")
+                    confidence = event_state.get("confidence")
+                    event_text = f"Triggered: {event_label}"
+                    if confidence is not None:
+                        event_text += f" ({confidence:.2f})"
+                    result = draw_text(
+                        result,
+                        event_text,
+                        (10, 30),
+                        color=(0, 0, 255),
+                        font_scale=0.8,
+                        thickness=2,
+                        bg_color=(0, 0, 0),
+                    )
+
+        return result
 
     def signal_handler(signum, frame):
         logger.info(f"[FenceWorker] 收到终止信号 {camera_id}")
@@ -473,6 +586,7 @@ def fence_worker(camera_id: str, rtsp_url: str, fence_area: List, output_host: s
 
                 try:
                     cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
+                    frame = draw_preview_overlay(frame)
                 except Exception as exc:
                     logger.error(f"[FenceWorker] 画围栏失败: {exc}")
 
@@ -594,8 +708,53 @@ def get_rtsp_push_host() -> str:
     return "127.0.0.1"
 
 
+def get_algorithm_display_name(algo_type: str) -> str:
+    """Return a user-friendly algorithm name for preview overlay."""
+    return {
+        "1": "Intrusion",
+        "2": "Helmet",
+        "3": "Overcrowd",
+        "4": "Smoke/Fire",
+    }.get(algo_type, f"Algo-{algo_type}")
+
+
+def handle_preview_event(camera_id: str, event, result: DetectionResultBundle):
+    """Store the latest triggered event so preview overlay can show it."""
+    if system_state.preview_event_states is None:
+        return
+    system_state.preview_event_states[camera_id] = {
+        "event_type": event.event_type.value,
+        "event_label": event.event_type.value.replace("_", " ").upper(),
+        "confidence": round(event.confidence, 2) if event.confidence is not None else None,
+        "updated_at": time.time(),
+    }
+
+
+def handle_preview_detections(camera_id: str, result: DetectionResultBundle):
+    """Store latest visible detections for preview overlay."""
+    if system_state.preview_detection_states is None:
+        return
+
+    detections = []
+    for det in result.detections or []:
+        try:
+            detections.append({
+                "bbox": [int(det.x1), int(det.y1), int(det.x2), int(det.y2)],
+                "label": str(det.class_name or det.class_id),
+                "confidence": round(float(det.conf), 2),
+            })
+        except Exception:
+            continue
+
+    system_state.preview_detection_states[camera_id] = {
+        "detections": detections,
+        "updated_at": time.time(),
+    }
+
+
 def initialize_system() -> Tuple[StreamManagerV2, Dict]:
     """初始化系统组件 V2"""
+    ensure_preview_state_manager()
     logger.info("=" * 60)
     logger.info("[System] Initializing Video Analytics System V2")
     logger.info("[System] Optimizations: Producer-Consumer + ThreadPool + CircularBuffer")
@@ -648,6 +807,8 @@ def initialize_system() -> Tuple[StreamManagerV2, Dict]:
         alarm_service=alarm_service,
         video_service=video_service
     )
+    stream_manager.set_event_callback(handle_preview_event)
+    stream_manager.set_result_callback(handle_preview_detections)
 
     # 注册检测器工厂（每个流独立实例）
     logger.info("[System] Registering detector factories...")
@@ -699,16 +860,15 @@ def set_fence():
     rtsp_url = data.get("url")
     rect = data.get("fence_area")
     default_area = data.get("default_area", {"width": 960, "height": 540})
-    camera_id = str(data.get("cam_id"))
+    camera_id = normalize_camera_id(data.get("cam_id"))
+    algo_type_str = normalize_algorithm_type(algorithm_type)
 
-    if not all([algorithm_type, rtsp_url, camera_id]):
+    if not all([algo_type_str, rtsp_url, camera_id]):
         return jsonify({
             "status": "error",
             "message": "缺少必要参数: algorithmType, url, cam_id"
         }), 400
 
-    algo_map = {1: "1", 2: "2", 3: "3", 4: "4"}
-    algo_type_str = algo_map.get(algorithm_type)
     if not algo_type_str:
         return jsonify({
             "status": "error",
@@ -789,7 +949,15 @@ def set_fence():
 
             p = Process(
                 target=fence_worker,
-                args=(camera_id, rtsp_url, fence_area, output_host),
+                args=(
+                    camera_id,
+                    rtsp_url,
+                    fence_area,
+                    output_host,
+                    algo_type_str,
+                    system_state.preview_event_states,
+                    system_state.preview_detection_states,
+                ),
                 daemon=True
             )
             p.start()
@@ -833,7 +1001,7 @@ def delete_stream():
     """停止流并删除围栏"""
     system_state.total_requests += 1
     data = request.get_json() or {}
-    camera_id = str(data.get("cam_id"))
+    camera_id = normalize_camera_id(data.get("cam_id"))
 
     if not camera_id:
         return jsonify({
@@ -842,6 +1010,10 @@ def delete_stream():
         }), 400
 
     try:
+        if system_state.preview_event_states is not None:
+            system_state.preview_event_states.pop(camera_id, None)
+        if system_state.preview_detection_states is not None:
+            system_state.preview_detection_states.pop(camera_id, None)
         # stop_fence_worker 内部已处理锁，不要在外层加锁
         stop_fence_worker(camera_id)
         if system_state.stream_manager:
