@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 from datetime import datetime
 from dataclasses import dataclass
+import logging
 
 from video_analytics.detectors.base_detector import (
     BaseDetector, DetectionContext, DetectionResultBundle,
@@ -14,6 +15,8 @@ from video_analytics.detectors.base_detector import (
 )
 from video_analytics.engines.base_engine import BaseInferEngine, DetectionResult
 from video_analytics.core.state_machine import EventStateMachine, EventState
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -123,8 +126,10 @@ class IntrusionDetector(BaseDetector):
         if camera_id not in self._fences:
             # 如果没有设置围栏，默认检测整个画面 (只要有人就算闯入)
             # 或者设置为None表示全图检测
-            print(f"[IntrusionDetector] Warning: No fence configured for {camera_id}, "
-                  f"using full frame detection")
+            logger.warning(
+                "[IntrusionDetector] No fence configured for %s, using full frame detection",
+                camera_id,
+            )
             # 创建一个覆盖全图的围栏
             h, w = frame.shape[:2]
             self._fences[camera_id] = FenceRegion(
@@ -161,8 +166,10 @@ class IntrusionDetector(BaseDetector):
         has_intrusion = len(intruders) > 0
         state = state_machine.update(has_intrusion)
 
-        # 6. 可视化
-        visualized = self._visualize(frame, person_dets, intruders, fence, state)
+        # 6. 仅在触发/持续告警时生成可视化，避免高分辨率下每帧拷贝整张图
+        visualized = None
+        if state in [EventState.TRIGGERED, EventState.ONGOING]:
+            visualized = self._visualize(frame, person_dets, intruders, fence, state)
 
         # 7. 构建结果
         result = DetectionResultBundle(

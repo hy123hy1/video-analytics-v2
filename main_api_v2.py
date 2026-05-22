@@ -21,10 +21,12 @@ import json
 import threading
 import subprocess
 import queue
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Optional, Set, Tuple, Callable
-from multiprocessing import Manager, Process
+from multiprocessing import Manager, Process, freeze_support
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,10 +49,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid integer env %s=%r, using default %s", name, value, default)
+        return default
+
+
+def _get_env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid float env %s=%r, using default %s", name, value, default)
+        return default
+
 from video_analytics.config.settings_v2 import AppConfigV2 as AppConfig
 from video_analytics.config.runtime_files import ensure_runtime_file
 from video_analytics.engines.factory import create_infer_engine
-from video_analytics.engines.ultralytics_engine import YOLOV8_CLASSES, SAFETY_HELMET_CLASSES, SMOKE_FIRE_CLASSES
+from video_analytics.utils import YOLOV8_CLASSES, SAFETY_HELMET_CLASSES
 from video_analytics.detectors.intrusion_detector import IntrusionDetector, FenceRegion
 from video_analytics.detectors.helmet_detector import HelmetDetector
 from video_analytics.detectors.overcrowd_detector import OvercrowdDetector
@@ -63,6 +87,11 @@ from video_analytics.services.video_service_v2 import VideoServiceV2, VideoConfi
 from video_analytics.services.storage_service import StorageServiceFactory
 from video_analytics.services.alarm_service import AlarmServiceFactory
 from video_analytics.utils.viz_utils import draw_text
+
+SMOKE_FIRE_CLASSES = {
+    0: "smoke",
+    1: "fire",
+}
 
 
 # =========================
@@ -97,11 +126,10 @@ system_state = SystemState()
 
 
 def ensure_preview_state_manager():
-    """Lazily create the shared preview state manager in the main process only."""
-    if system_state.preview_state_manager is None:
-        system_state.preview_state_manager = Manager()
-        system_state.preview_event_states = system_state.preview_state_manager.dict()
-        system_state.preview_detection_states = system_state.preview_state_manager.dict()
+    """Preview shared state disabled temporarily to reduce startup overhead."""
+    system_state.preview_state_manager = None
+    system_state.preview_event_states = None
+    system_state.preview_detection_states = None
 
 
 # =========================
@@ -386,16 +414,25 @@ def fence_worker(
     camera_id: str,
     rtsp_url: str,
     fence_area: List,
-    output_host: str = "127.0.0.1",
+    rtsp_push_url: str = "rtsp://127.0.0.1:554/Streaming/Channels/default",
     algorithm_type: Optional[str] = None,
     preview_event_states=None,
     preview_detection_states=None,
 ):
     """画框工作进程，使用有界队列解耦读帧和推流。"""
     import signal
+    import logging
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[logging.StreamHandler(sys.stdout)]
+        )
 
     logger.info(f"[FenceWorker] 启动画框进程 camera_id={camera_id}")
     logger.info(f"[FenceWorker] 输入流: {rtsp_url}")
+    print(f"[FenceWorker] 输入流: {rtsp_url}", flush=True)
 
     stop_flag = threading.Event()
     frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
@@ -405,6 +442,12 @@ def fence_worker(
     frame_counter = 0
     last_log_time = time.time()
     overlay_ttl_seconds = 5.0
+    ffmpeg_restart_times: List[float] = []
+    ffmpeg_max_rapid_restarts = _get_env_int("VA_FENCE_FFMPEG_MAX_RAPID_RESTARTS", 8)
+    ffmpeg_restart_window_seconds = _get_env_float("VA_FENCE_FFMPEG_RAPID_WINDOW_SECONDS", 10.0)
+    ffmpeg_restart_cooldown_seconds = _get_env_float("VA_FENCE_FFMPEG_RESTART_COOLDOWN_SECONDS", 5.0)
+    ffmpeg_last_stderr_lines: "queue.Queue[str]" = queue.Queue(maxsize=20)
+    ffmpeg_stderr_lock = threading.Lock()
 
     def draw_preview_overlay(frame: np.ndarray) -> np.ndarray:
         result = frame
@@ -483,9 +526,9 @@ def fence_worker(
         return capture
 
     def start_ffmpeg(width: int, height: int, fps: int):
-        rtsp_push = f"rtsp://{output_host}:554/Streaming/Channels/{camera_id}"
         ffmpeg_cmd = [
             "ffmpeg", "-y",
+            "-loglevel", "warning",
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24",
@@ -496,25 +539,63 @@ def fence_worker(
             "-preset", "ultrafast",
             "-tune", "zerolatency",
             "-pix_fmt", "yuv420p",
-            "-profile:v", "baseline",
-            "-level", "3.0",
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
-            rtsp_push,
+            rtsp_push_url,
         ]
 
         kwargs = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        logger.info(f"[FenceWorker] 启动FFmpeg推流到 {rtsp_push}")
-        return subprocess.Popen(
+        logger.info(f"[FenceWorker] 启动FFmpeg推流到 {rtsp_push_url}")
+        logger.info("[FenceWorker] FFmpeg命令: %s", subprocess.list2cmdline(ffmpeg_cmd))
+        proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
             **kwargs,
         )
+        start_ffmpeg_stderr_logger(proc)
+        return proc
+
+    def start_ffmpeg_stderr_logger(proc: subprocess.Popen):
+        def _stderr_reader():
+            if proc.stderr is None:
+                return
+
+            try:
+                for raw_line in proc.stderr:
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                    else:
+                        line = raw_line.strip()
+                    if not line:
+                        continue
+                    with ffmpeg_stderr_lock:
+                        if ffmpeg_last_stderr_lines.full():
+                            try:
+                                ffmpeg_last_stderr_lines.get_nowait()
+                            except queue.Empty:
+                                pass
+                        ffmpeg_last_stderr_lines.put_nowait(line)
+                    logger.warning("[FenceWorker][FFmpeg:%s] %s", camera_id, line)
+            except Exception as exc:
+                logger.debug("[FenceWorker] FFmpeg stderr reader stopped for %s: %s", camera_id, exc)
+
+        threading.Thread(
+            target=_stderr_reader,
+            name=f"FenceFFmpegErr-{camera_id}",
+            daemon=True,
+        ).start()
+
+    def get_ffmpeg_error_summary() -> str:
+        with ffmpeg_stderr_lock:
+            lines = list(ffmpeg_last_stderr_lines.queue)
+        if not lines:
+            return "no stderr captured"
+        return " | ".join(lines[-3:])
 
     def stop_ffmpeg():
         nonlocal push_proc
@@ -534,7 +615,25 @@ def fence_worker(
             push_proc = None
 
     def restart_ffmpeg(width: int, height: int, fps: int):
+        now = time.time()
+        ffmpeg_restart_times.append(now)
+        ffmpeg_restart_times[:] = [
+            ts for ts in ffmpeg_restart_times
+            if now - ts <= ffmpeg_restart_window_seconds
+        ]
+        if len(ffmpeg_restart_times) > ffmpeg_max_rapid_restarts:
+            logger.error(
+                "[FenceWorker] FFmpeg在%.1f秒内重启超过%d次，停止重启。最近错误: %s",
+                ffmpeg_restart_window_seconds,
+                ffmpeg_max_rapid_restarts,
+                get_ffmpeg_error_summary(),
+            )
+            stop_flag.set()
+            raise RuntimeError("FFmpeg restart limit exceeded")
+
         stop_ffmpeg()
+        if ffmpeg_restart_times:
+            time.sleep(ffmpeg_restart_cooldown_seconds)
         return start_ffmpeg(width, height, fps)
 
     try:
@@ -611,17 +710,29 @@ def fence_worker(
                     continue
 
                 if push_proc is None or push_proc.poll() is not None:
-                    logger.warning(f"[FenceWorker] FFmpeg 推流进程已退出，重启 {camera_id}")
+                    logger.warning(
+                        "[FenceWorker] FFmpeg 推流进程已退出，重启 %s，最近错误: %s",
+                        camera_id,
+                        get_ffmpeg_error_summary(),
+                    )
                     push_proc = restart_ffmpeg(width, height, fps)
 
                 try:
                     push_proc.stdin.write(frame.tobytes())
                 except BrokenPipeError:
-                    logger.warning(f"[FenceWorker] FFmpeg 推流中断，重启 {camera_id}")
+                    logger.warning(
+                        "[FenceWorker] FFmpeg 推流中断，重启 %s，最近错误: %s",
+                        camera_id,
+                        get_ffmpeg_error_summary(),
+                    )
                     push_proc = restart_ffmpeg(width, height, fps)
                     continue
                 except Exception as exc:
-                    logger.error(f"[FenceWorker] 推流异常: {exc}")
+                    logger.error(
+                        "[FenceWorker] 推流异常: %s，最近错误: %s",
+                        exc,
+                        get_ffmpeg_error_summary(),
+                    )
                     push_proc = restart_ffmpeg(width, height, fps)
                     continue
 
@@ -706,6 +817,145 @@ def get_rtsp_push_host() -> str:
     if system_state.config and system_state.config.server.rtsp_push_host:
         return system_state.config.server.rtsp_push_host
     return "127.0.0.1"
+
+
+def _build_rtsp_url_from_template(template: str, camera_id: str) -> str:
+    return template.format(camera_id=camera_id)
+
+
+def _append_query_params(url: str, params: Dict[str, str]) -> str:
+    filtered = {k: v for k, v in params.items() if v is not None and v != ""}
+    if not filtered:
+        return url
+
+    parsed = urlsplit(url)
+    query_items = []
+    if parsed.query:
+        for item in parsed.query.split("&"):
+            if not item:
+                continue
+            if "=" in item:
+                key, value = item.split("=", 1)
+            else:
+                key, value = item, ""
+            query_items.append((key, value))
+
+    existing_keys = {key for key, _ in query_items}
+    for key, value in filtered.items():
+        if key not in existing_keys:
+            query_items.append((key, value))
+
+    query = "&".join(
+        f"{key}={value}" if value != "" else key
+        for key, value in query_items
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _build_rtsp_push_auth_params(server_cfg) -> Dict[str, str]:
+    sign = (getattr(server_cfg, "rtsp_push_sign", "") or "").strip()
+    push_key = (getattr(server_cfg, "rtsp_push_key", "") or "").strip()
+    call_id = (getattr(server_cfg, "rtsp_push_call_id", "") or "").strip()
+
+    if not sign and push_key:
+        check_str = push_key if not call_id else f"{call_id}_{push_key}"
+        sign = hashlib.md5(check_str.encode("utf-8")).hexdigest()
+
+    params: Dict[str, str] = {}
+    if sign:
+        params["sign"] = sign
+    if call_id:
+        params["callId"] = call_id
+    return params
+
+
+def build_rtsp_push_url(camera_id: str) -> str:
+    """Build the internal RTSP publish URL for FFmpeg."""
+    if system_state.config:
+        server_cfg = system_state.config.server
+        template = (getattr(server_cfg, "rtsp_push_url_template", "") or "").strip()
+        if template:
+            push_url = _build_rtsp_url_from_template(template, camera_id)
+            return _append_query_params(push_url, _build_rtsp_push_auth_params(server_cfg))
+
+        host = server_cfg.rtsp_push_host or "127.0.0.1"
+        port = int(getattr(server_cfg, "rtsp_push_port", 554) or 554)
+        username = (getattr(server_cfg, "rtsp_push_username", "") or "").strip()
+        password = getattr(server_cfg, "rtsp_push_password", "") or ""
+        auth = ""
+        if username:
+            auth = username
+            if password:
+                auth += f":{password}"
+            auth += "@"
+        push_url = f"rtsp://{auth}{host}:{port}/Streaming/Channels/{camera_id}"
+        return _append_query_params(push_url, _build_rtsp_push_auth_params(server_cfg))
+
+    return f"rtsp://127.0.0.1:554/Streaming/Channels/{camera_id}"
+
+
+def get_rtsp_public_host() -> str:
+    """Return the RTSP host exposed to clients/players."""
+    if system_state.config:
+        public_host = getattr(system_state.config.server, "rtsp_public_host", "") or ""
+        if public_host:
+            return public_host
+        if system_state.config.server.rtsp_push_host:
+            return system_state.config.server.rtsp_push_host
+    return "127.0.0.1"
+
+
+def build_rtsp_public_url(camera_id: str) -> str:
+    """Build the RTSP URL returned to clients for playback."""
+    if system_state.config:
+        template = (getattr(system_state.config.server, "rtsp_public_url_template", "") or "").strip()
+        if template:
+            return _build_rtsp_url_from_template(template, camera_id)
+
+    output_host = get_rtsp_public_host()
+    output_port = 554
+    if system_state.config:
+        output_port = int(getattr(system_state.config.server, "rtsp_public_port", 554) or 554)
+    return f"rtsp://{output_host}:{output_port}/Streaming/Channels/{camera_id}"
+
+
+def resolve_source_rtsp_url(rtsp_url: str) -> str:
+    """Rewrite externally provided RTSP host to the locally reachable host when configured."""
+    if not rtsp_url or not system_state.config:
+        return rtsp_url
+
+    public_host = getattr(system_state.config.server, "rtsp_source_public_host", "") or ""
+    local_host = getattr(system_state.config.server, "rtsp_source_local_host", "") or ""
+    if not public_host or not local_host:
+        return rtsp_url
+
+    try:
+        parsed = urlsplit(rtsp_url)
+        hostname = parsed.hostname
+        if not hostname or hostname != public_host:
+            return rtsp_url
+
+        userinfo = ""
+        if parsed.username:
+            userinfo = parsed.username
+            if parsed.password:
+                userinfo += f":{parsed.password}"
+            userinfo += "@"
+
+        port = f":{parsed.port}" if parsed.port else ""
+        rewritten_netloc = f"{userinfo}{local_host}{port}"
+        rewritten_url = urlunsplit((
+            parsed.scheme,
+            rewritten_netloc,
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        ))
+        logger.info("[RTSP] Source URL rewritten from %s to %s", rtsp_url, rewritten_url)
+        return rewritten_url
+    except Exception as e:
+        logger.warning(f"[RTSP] Failed to rewrite source URL, using original: {e}")
+        return rtsp_url
 
 
 def get_algorithm_display_name(algo_type: str) -> str:
@@ -876,29 +1126,36 @@ def set_fence():
         }), 400
 
     logger.info(f"[API] 请求启动 camera_id={camera_id}, algo={algo_type_str}")
+    source_rtsp_url = resolve_source_rtsp_url(rtsp_url)
 
     try:
-        cap = cv2.VideoCapture(rtsp_url)
-        if not cap.isOpened():
-            return jsonify({
-                "status": "error",
-                "message": "无法打开RTSP流"
-            }), 500
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
+        width = 0
+        height = 0
+        cap = None
+        try:
+            cap = cv2.VideoCapture(source_rtsp_url)
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                logger.info(f"[API] 视频分辨率: {width}x{height}")
+            else:
+                logger.warning("[API] 无法立即打开RTSP流，继续按请求参数返回")
+        except Exception as e:
+            logger.warning(f"[API] 预探测RTSP流失败，继续按请求参数返回: {e}")
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
         # 等待确保摄像头连接完全释放，避免fence_worker读取重复帧
         time.sleep(1.0)
 
         if not width or not height:
-            return jsonify({
-                "status": "error",
-                "message": "无法获取视频分辨率"
-            }), 500
-
-        logger.info(f"[API] 视频分辨率: {width}x{height}")
+            width = int(default_area.get("width", 960) or 960)
+            height = int(default_area.get("height", 540) or 540)
+            logger.warning(f"[API] 使用默认分辨率兜底: {width}x{height}")
 
         if rect:
             fence_area = rect_to_polygon(rect, default_area, width, height)
@@ -919,7 +1176,7 @@ def set_fence():
         config = system_state.config
         stream_config = StreamConfig(
             camera_id=camera_id,
-            rtsp_url=rtsp_url,
+            rtsp_url=source_rtsp_url,
             ip_address="",
             algorithm_types={algo_type_str},
             fps=config.stream.fps,
@@ -945,15 +1202,16 @@ def set_fence():
         try:
             system_state.stream_manager.set_detector_fence(camera_id, fence_area)
 
-            output_host = get_rtsp_push_host()
+            push_url = build_rtsp_push_url(camera_id)
+            logger.info("[API] 内部推流地址: %s", push_url)
 
             p = Process(
                 target=fence_worker,
                 args=(
                     camera_id,
-                    rtsp_url,
+                    source_rtsp_url,
                     fence_area,
-                    output_host,
+                    push_url,
                     algo_type_str,
                     system_state.preview_event_states,
                     system_state.preview_detection_states,
@@ -974,9 +1232,7 @@ def set_fence():
             }
             system_state.fence_dict[camera_id] = fence_area
 
-        output_host = get_rtsp_push_host()
-
-        output_url = f"rtsp://{output_host}:554/Streaming/Channels/{camera_id}"
+        output_url = build_rtsp_public_url(camera_id)
         logger.info(f"[API] 画框流输出地址: {output_url}")
 
         return jsonify({
@@ -1165,4 +1421,5 @@ def main():
 
 
 if __name__ == "__main__":
+    freeze_support()
     main()

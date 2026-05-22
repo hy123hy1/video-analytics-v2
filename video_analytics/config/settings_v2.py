@@ -300,6 +300,18 @@ class ServerConfig:
     port: int = 5005
     debug: bool = False
     rtsp_push_host: str = "127.0.0.1"
+    rtsp_push_port: int = 554
+    rtsp_public_host: str = ""
+    rtsp_public_port: int = 554
+    rtsp_push_url_template: str = ""
+    rtsp_public_url_template: str = ""
+    rtsp_push_username: str = ""
+    rtsp_push_password: str = ""
+    rtsp_push_sign: str = ""
+    rtsp_push_key: str = ""
+    rtsp_push_call_id: str = ""
+    rtsp_source_public_host: str = ""
+    rtsp_source_local_host: str = ""
     log_level: str = "INFO"
     log_file: Optional[str] = None
 
@@ -312,6 +324,42 @@ class ServerConfig:
             debug=_get_env_value("VA_SERVER_DEBUG", cls.debug, bool),
             rtsp_push_host=_get_env_value(
                 "VA_SERVER_RTSP_PUSH_HOST", cls.rtsp_push_host
+            ),
+            rtsp_push_port=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_PORT", cls.rtsp_push_port, int
+            ),
+            rtsp_public_host=_get_env_value(
+                "VA_SERVER_RTSP_PUBLIC_HOST", cls.rtsp_public_host
+            ),
+            rtsp_public_port=_get_env_value(
+                "VA_SERVER_RTSP_PUBLIC_PORT", cls.rtsp_public_port, int
+            ),
+            rtsp_push_url_template=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_URL_TEMPLATE", cls.rtsp_push_url_template
+            ),
+            rtsp_public_url_template=_get_env_value(
+                "VA_SERVER_RTSP_PUBLIC_URL_TEMPLATE", cls.rtsp_public_url_template
+            ),
+            rtsp_push_username=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_USERNAME", cls.rtsp_push_username
+            ),
+            rtsp_push_password=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_PASSWORD", cls.rtsp_push_password
+            ),
+            rtsp_push_sign=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_SIGN", cls.rtsp_push_sign
+            ),
+            rtsp_push_key=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_KEY", cls.rtsp_push_key
+            ),
+            rtsp_push_call_id=_get_env_value(
+                "VA_SERVER_RTSP_PUSH_CALL_ID", cls.rtsp_push_call_id
+            ),
+            rtsp_source_public_host=_get_env_value(
+                "VA_SERVER_RTSP_SOURCE_PUBLIC_HOST", cls.rtsp_source_public_host
+            ),
+            rtsp_source_local_host=_get_env_value(
+                "VA_SERVER_RTSP_SOURCE_LOCAL_HOST", cls.rtsp_source_local_host
             ),
             log_level=_get_env_value("VA_SERVER_LOG_LEVEL", cls.log_level),
             log_file=_get_env_value("VA_SERVER_LOG_FILE", cls.log_file),

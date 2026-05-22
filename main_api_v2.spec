@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
-from pathlib import Path
+import os
 
 datas = []
 binaries = []
@@ -8,10 +8,10 @@ hiddenimports = []
 tmp_ret = collect_all('video_analytics')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-project_root = Path(__file__).resolve().parent
+project_root = os.getcwd()
 datas += [
-    (str(project_root / '.env.example'), '.'),
-    (str(project_root / 'cfg' / 'config.runtime.example.json'), 'cfg'),
+    (os.path.join(project_root, '.env.example'), '.'),
+    (os.path.join(project_root, 'cfg', 'config.runtime.example.json'), 'cfg'),
 ]
 
 
@@ -24,7 +24,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['torchaudio'],
     noarchive=False,
     optimize=0,
 )
