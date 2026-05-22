@@ -28,6 +28,7 @@ ENV/
 # Build artifacts
 build/
 dist/
+dist_sl/
 *.spec.bak
 
 # Runtime outputs
